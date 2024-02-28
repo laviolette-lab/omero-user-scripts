@@ -22,38 +22,65 @@
 Generates a downsampled image
 """
 import os
+import asyncio
 import tempfile
 from time import time
 
 from omero import scripts, gateway
 from omero.rtypes import rlong, rstring, robject, rint
 
-from lavlab.python_util import save_image_binary
-from lavlab.omero_util import OMERO_DICTIONARY, getImageAtResolution, idsToImageIds, getDownsampledYXDimensions
+import numpy as np
+from skimage import io, transform, img_as_ubyte
+
+import PIL.Image
+PIL.Image.MAX_IMAGE_PIXELS = 933120000
+
+from lavlab.omero_util import getImageAtResolution, OMERO_DICTIONARY
+
+def idsToImageIds(conn, dType, rawIds):
+    """
+    Gathers image ids from given OMERO objects.
+
+    Takes Project and Dataset ids. Takes Image ids too for compatibility.
+    """
+    if dType != "Image" :
+        # project to dataset
+        if dType == "Project" :
+            projectIds = rawIds; rawIds = []
+            for projectId in projectIds :
+                for dataset in conn.getObjects('dataset', opts={'project' : projectId}) :
+                    rawIds.append(dataset.getId())
+        # dataset to image
+        ids=[]
+        for datasetId in rawIds :
+            for image in conn.getObjects('image', opts={'dataset' : datasetId}) :
+                ids.append(image.getId())
+    # else rename image ids
+    else : 
+        ids = rawIds
+    return ids
 
 def main(conn,ids):
-
-    NS = "LargeRecon."+str(downsampleFactor)
-    recons = []
+    start = time()
     for id in ids:
         img = conn.getObject("image", id)
-
         name = img.getName()
-        sizeX = img.getSizeX()
-        sizeY = img.getSizeY()
-
-        yx_dim=getDownsampledYXDimensions(img, downsampleFactor)
+        sizeC = img.getSizeC()
+        reconBin=None
+        desiredRes = (int(img.getSizeY() / downsampleFactor),
+                      int(img.getSizeX() / downsampleFactor),
+                      sizeC)
         reconPath = tempfile.gettempdir() + os.sep + f"LR{downsampleFactor}_{name.replace('.ome.tiff',EXT)}"
         recon = img.getAnnotation(NS)
         
         if recon is None:  
-            print(f"Downsampling: {name} from {(sizeY,sizeX)} to {yx_dim}")
-            reconBin = getImageAtResolution(img, yx_dim)
-            
-            if saveFormat == 'JPEG': jpeg=True 
-            else: jpeg=False
+            print(f"Downsampling: {name} from {(img.getSizeY(),img.getSizeX(), img.getSizeC())} to {desiredRes}")
 
-            save_image_binary(reconPath,reconBin, jpeg)
+            reconBin = getImageAtResolution(img, desiredRes)
+            if saveFormat == 'JPEG':
+                io.imsave(reconPath, reconBin,quality=100)
+            else:
+                io.imsave(reconPath, reconBin)
             
             print("Downsampling Complete! Uploading to OMERO...")
             recon = conn.createFileAnnfromLocalFile(reconPath, mimetype=MIME, ns=NS)
@@ -64,13 +91,10 @@ def main(conn,ids):
         else: 
             print("Large Recon already exists! Check in the attachments section. Delete the previous Large Recon to generate a new one.")
         
-        # do this outside of if recon in case of a previous attempt residing there
         if os.path.isfile(reconPath):
             os.remove(reconPath)
         
-        recons.append(recon)
-    return recons
-        
+    print(f"Script took: {time()-start}")
         
 
 if __name__ == "__main__":
@@ -87,8 +111,12 @@ if __name__ == "__main__":
         rint(8)
     ]
 
-    supported_save_formats = OMERO_DICTIONARY["SKIMAGE_FORMATS"].keys()
-
+    # from OMERO_DICTIONARY["SKIMAGE_FORMATS"]
+    imgTypes = [
+        rstring('JPEG'),
+        rstring('TIFF'),
+        rstring('PNG')
+    ]
     client = scripts.client(
         'Large Recon', """Generates a downsampled image for processing""",
         scripts.String(
@@ -109,7 +137,7 @@ if __name__ == "__main__":
         scripts.String(
             "Save_Format", optional=False, grouping="3",
             description="What format to save recon as?",
-            values=supported_save_formats, default=supported_save_formats[0]
+            values=imgTypes, default=imgTypes[0]
         ),
         version="1",
         authors=["Michael Barrett"],
@@ -128,19 +156,18 @@ if __name__ == "__main__":
         ids = idsToImageIds(conn, dataType, rawIds)
 
         # parse image save format
-        EXT = OMERO_DICTIONARY["SKIMAGE_FORMATS"][saveFormat]["EXT"][0]
+        EXT = OMERO_DICTIONARY["SKIMAGE_FORMATS"][saveFormat]["EXT"]
         MIME = OMERO_DICTIONARY["SKIMAGE_FORMATS"][saveFormat]["MIME"]
 
+        NS = "LargeRecon."+str(downsampleFactor)
         
         # run processing
-        start = time()
         main(conn, ids)
-        print(f"Script took: {time()-start}")
-        client.setOutput("Message", rstring("Success")) 
+        # client.setOutput("Message", rstring("Success")) 
 
     except Exception as e:
         print(e)
-        client.setOutput("Message", rstring("Failed"))
+        # client.setOutput("Message", rstring("Failed"))
 
     finally:
         conn.close()
